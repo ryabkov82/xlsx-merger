@@ -27,6 +27,11 @@ func NewStreamMerger() FileMerger {
 
 func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 
+	// Удаляем старые файлы перед началом
+	if err := removeExistingPartFiles(cfg); err != nil {
+		return nil, err
+	}
+
 	var (
 		templatePath string
 		maxFileSize  int64
@@ -65,7 +70,6 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 				return fmt.Errorf("ошибка финального flush: %v", err)
 			}
 			fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"), partCounter)
-			_ = os.Remove(fileName)
 			if err := outFile.SaveAs(fileName); err != nil {
 				return fmt.Errorf("ошибка сохранения файла: %v", err)
 			}
@@ -350,7 +354,6 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 		return nil, fmt.Errorf("ошибка финального flush: %v", err)
 	}
 	fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"), partCounter)
-	_ = os.Remove(fileName)
 	if err := outFile.SaveAs(fileName); err != nil {
 		return nil, fmt.Errorf("ошибка сохранения файла: %v", err)
 	}
@@ -360,4 +363,19 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 
 	return outputFiles, nil
 
+}
+
+func removeExistingPartFiles(cfg *config.Config) error {
+	pattern := fmt.Sprintf("%s_part*.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"))
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return fmt.Errorf("ошибка поиска файлов по шаблону: %v", err)
+	}
+
+	for _, file := range files {
+		if err := os.Remove(file); err != nil {
+			return fmt.Errorf("ошибка удаления файла %s: %v", file, err)
+		}
+	}
+	return nil
 }
