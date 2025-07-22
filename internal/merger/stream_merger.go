@@ -235,6 +235,27 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 			return nil, fmt.Errorf("ошибка чтения строк из %s: %v", path, err)
 		}
 
+		for colIdx := 1; colIdx <= len(sm.Headers); colIdx++ {
+			// Получаем имя колонки (например, "A", "B")
+			colName, _ := excelize.ColumnNumberToName(colIdx)
+
+			// Получаем ширину колонки из исходного листа
+			width, err := f.GetColWidth(sheetSrc, colName)
+			if err != nil {
+				continue // Пропускаем ошибки
+			}
+
+			widthCurrent, err := outFile.GetColWidth(sheet, colName)
+			if err != nil {
+				continue // Пропускаем ошибки
+			}
+
+			if width > widthCurrent {
+				// Устанавливаем такую же ширину в целевом листе
+				outFile.SetColWidth(sheet, colName, colName, width)
+			}
+		}
+
 		rowInFile := 1
 
 		if cfg.HasHeaders {

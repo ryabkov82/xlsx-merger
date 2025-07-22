@@ -21,7 +21,7 @@ func ParseFlags() (*Config, error) {
 
 	flag.StringVar(&cfg.InputDir, "dir", "", "папка с исходными XLSX файлами")
 	flag.StringVar(&cfg.OutputPath, "out", "./merged.xlsx", "результирующий файл")
-	flag.IntVar(&cfg.SampleRows, "sample", 50, "количество анализируемых строк")
+	flag.IntVar(&cfg.SampleRows, "sample", 1000, "количество анализируемых строк")
 	flag.BoolVar(&cfg.AddSourceFile, "add-source", false, "добавлять колонку с именем файла")
 	flag.BoolVar(&cfg.HasHeaders, "has-headers", false, "исходные файлы содержат заголовки")
 	flag.Int64Var(&cfg.MaxRowPerFile, "max-row", 600000, "максимальное количество строк в объединенном файле")
