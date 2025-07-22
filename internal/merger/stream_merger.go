@@ -65,6 +65,7 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 				return fmt.Errorf("ошибка финального flush: %v", err)
 			}
 			fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"), partCounter)
+			_ = os.Remove(fileName)
 			if err := outFile.SaveAs(fileName); err != nil {
 				return fmt.Errorf("ошибка сохранения файла: %v", err)
 			}
@@ -82,18 +83,43 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 		if len(sheetList) == 0 {
 			return fmt.Errorf("шаблон пустой, нет листов")
 		}
-		sheet = sheetList[0]
+		sheet = "merged"
+		outFile.NewSheet(sheet)
+
+		// 2. Копируем ширину для каждой колонки
+		for colIdx := 1; colIdx <= len(sm.Headers); colIdx++ {
+			// Получаем имя колонки (например, "A", "B")
+			colName, _ := excelize.ColumnNumberToName(colIdx)
+
+			// Получаем ширину колонки из исходного листа
+			width, err := outFile.GetColWidth(sheetList[0], colName)
+			if err != nil {
+				continue // Пропускаем ошибки
+			}
+
+			// Устанавливаем такую же ширину в целевом листе
+			outFile.SetColWidth(sheet, colName, colName, width)
+		}
+
 		streamWriter, err = outFile.NewStreamWriter(sheet)
 		if err != nil {
 			return fmt.Errorf("ошибка создания StreamWriter: %v", err)
 		}
+
+		outFile.DeleteSheet(sheetList[0])
 		rowCounter = 0
 		return nil
 	}
 
-	if err := newOutput(); err != nil {
-		return nil, err
+	outFile, err := excelize.OpenFile(templatePath)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка открытия шаблона: %v", err)
 	}
+	sheetList := outFile.GetSheetList()
+	if len(sheetList) == 0 {
+		return nil, fmt.Errorf("шаблон пустой, нет листов")
+	}
+	sheet = sheetList[0]
 
 	rows, err := outFile.Rows(sheet)
 	if err != nil {
@@ -178,6 +204,13 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 
 		}
 		rowIdx++
+	}
+
+	_ = outFile.Close()
+	outFile = nil
+
+	if err := newOutput(); err != nil {
+		return nil, err
 	}
 
 	// Обход всех файлов
@@ -317,6 +350,7 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 		return nil, fmt.Errorf("ошибка финального flush: %v", err)
 	}
 	fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"), partCounter)
+	_ = os.Remove(fileName)
 	if err := outFile.SaveAs(fileName); err != nil {
 		return nil, fmt.Errorf("ошибка сохранения файла: %v", err)
 	}
@@ -325,4 +359,5 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 	_ = outFile.Close()
 
 	return outputFiles, nil
+
 }
