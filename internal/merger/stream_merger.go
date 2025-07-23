@@ -14,137 +14,221 @@ import (
 type StreamMerger struct {
 	BaseMerger
 	// Специфичные для потоковой обработки поля
-	BufferSize int
+	RowStyles    []int
+	HeaderStyles []int
+	ValueTypes   []excelize.CellType
+	StyleCache   map[string]int
+	UseTemplate  bool
+	Cfg          *config.Config
+	StreamWriter *excelize.StreamWriter
+	RowCounter   int64
+	HeightHeader float64
+	Sheet        string
+	OutFile      *excelize.File
+	PartCounter  int
+	OutputFiles  []string
 }
 
 func NewStreamMerger() FileMerger {
-	sm := &StreamMerger{
-		BufferSize: 1000,
-	}
+	sm := &StreamMerger{}
 	sm.BaseMerger.Init() // Инициализация базовой части
 	return sm
 }
 
-func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
-
-	// Удаляем старые файлы перед началом
-	if err := removeExistingPartFiles(cfg); err != nil {
-		return nil, err
+func (sm *StreamMerger) newOutput() error {
+	// Завершение текущего файла
+	if sm.OutFile != nil {
+		if err := sm.StreamWriter.Flush(); err != nil {
+			return fmt.Errorf("ошибка финального flush: %v", err)
+		}
+		fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(sm.Cfg.OutputPath, ".xlsx"), sm.PartCounter)
+		if err := sm.OutFile.SaveAs(fileName); err != nil {
+			return fmt.Errorf("ошибка сохранения файла: %v", err)
+		}
+		_ = sm.OutFile.Close()
+		sm.OutputFiles = append(sm.OutputFiles, fileName)
+		sm.PartCounter++
 	}
 
-	var (
-		templatePath string
-		maxFileSize  int64
-	)
-
-	inputFiles := []string{}
-	_ = filepath.Walk(cfg.InputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || filepath.Ext(path) != ".xlsx" {
-			return nil
-		}
-
-		inputFiles = append(inputFiles, path)
-
-		if cfg.TemplatePath == "" && info.Size() > maxFileSize {
-			maxFileSize = info.Size()
-			templatePath = path
-		}
-
-		return nil
-	})
-
-	if cfg.TemplatePath != "" {
-		if _, err := os.Stat(cfg.TemplatePath); os.IsNotExist(err) {
-			return nil, fmt.Errorf("шаблонный файл не найден: %s", cfg.TemplatePath)
-		}
-		templatePath = cfg.TemplatePath
-	}
-
-	if templatePath == "" {
-		return nil, fmt.Errorf("не удалось определить шаблонный файл")
-	}
-
-	useTemplate := cfg.TemplatePath != ""
-
-	partCounter := 1
-	rowCounter := int64(0)
-	var outFile *excelize.File
-	var streamWriter *excelize.StreamWriter
-	var sheet string
-	outputFiles := []string{}
-
-	newOutput := func() error {
-		if outFile != nil {
-			if err := streamWriter.Flush(); err != nil {
-				return fmt.Errorf("ошибка финального flush: %v", err)
-			}
-			fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"), partCounter)
-			if err := outFile.SaveAs(fileName); err != nil {
-				return fmt.Errorf("ошибка сохранения файла: %v", err)
-			}
-			_ = outFile.Close()
-			outputFiles = append(outputFiles, fileName)
-			partCounter++
-		}
-
-		var err error
-		outFile, err = excelize.OpenFile(templatePath)
-		if err != nil {
-			return fmt.Errorf("ошибка открытия шаблона: %v", err)
-		}
-		sheetList := outFile.GetSheetList()
-		if len(sheetList) == 0 {
-			return fmt.Errorf("шаблон пустой, нет листов")
-		}
-		sheet = "merged"
-		outFile.NewSheet(sheet)
-
-		// 2. Копируем ширину для каждой колонки
-		for colIdx := 1; colIdx <= len(sm.Headers); colIdx++ {
-			// Получаем имя колонки (например, "A", "B")
-			colName, _ := excelize.ColumnNumberToName(colIdx)
-
-			// Получаем ширину колонки из исходного листа
-			width, err := outFile.GetColWidth(sheetList[0], colName)
-			if err != nil {
-				continue // Пропускаем ошибки
-			}
-
-			// Устанавливаем такую же ширину в целевом листе
-			outFile.SetColWidth(sheet, colName, colName, width)
-		}
-
-		streamWriter, err = outFile.NewStreamWriter(sheet)
-		if err != nil {
-			return fmt.Errorf("ошибка создания StreamWriter: %v", err)
-		}
-
-		outFile.DeleteSheet(sheetList[0])
-		rowCounter = 0
-		return nil
-	}
-
-	outFile, err := excelize.OpenFile(templatePath)
+	var err error
+	sm.OutFile, err = excelize.OpenFile(sm.Cfg.TemplatePath)
 	if err != nil {
-		return nil, fmt.Errorf("ошибка открытия шаблона: %v", err)
+		return fmt.Errorf("ошибка открытия шаблона: %v", err)
 	}
-	sheetList := outFile.GetSheetList()
+	sheetList := sm.OutFile.GetSheetList()
 	if len(sheetList) == 0 {
-		return nil, fmt.Errorf("шаблон пустой, нет листов")
+		return fmt.Errorf("шаблон пустой, нет листов")
 	}
-	sheet = sheetList[0]
+	sm.Sheet = "merged"
+	sm.OutFile.NewSheet(sm.Sheet)
 
-	rows, err := outFile.Rows(sheet)
+	// Копируем ширину колонок из первого листа шаблона
+	for colIdx := 1; colIdx <= len(sm.Headers); colIdx++ {
+		colName, _ := excelize.ColumnNumberToName(colIdx)
+		width, err := sm.OutFile.GetColWidth(sheetList[0], colName)
+		if err == nil {
+			sm.OutFile.SetColWidth(sm.Sheet, colName, colName, width)
+		}
+	}
+
+	sm.StreamWriter, err = sm.OutFile.NewStreamWriter(sm.Sheet)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("ошибка создания StreamWriter: %v", err)
 	}
 
-	heightHeader := 0.0
-	// Получаем заголовки из первого файла
+	sm.OutFile.DeleteSheet(sheetList[0])
+	sm.RowCounter = 0
+
+	return nil
+}
+
+func (sm *StreamMerger) processInputFile(path string) error {
+	f, err := excelize.OpenFile(path)
+	if err != nil {
+		return fmt.Errorf("ошибка открытия файла %s: %v", path, err)
+	}
+	defer f.Close()
+
+	sheetListSrc := f.GetSheetList()
+	if len(sheetListSrc) == 0 {
+		return nil
+	}
+	sheetSrc := sheetListSrc[0]
+
+	rows, err := f.Rows(sheetSrc)
+	if err != nil {
+		return fmt.Errorf("ошибка чтения строк из %s: %v", path, err)
+	}
+
+	rowInFile := 1
+	if sm.Cfg.HasHeaders {
+		rows.Next()
+		rowInFile++
+	}
+
+	for rows.Next() {
+		if sm.Cfg.MaxRowPerFile > 0 && sm.RowCounter >= sm.Cfg.MaxRowPerFile {
+			if err := sm.newOutput(); err != nil {
+				return err
+			}
+		}
+
+		if sm.RowCounter == 0 {
+			if sm.Cfg.HasHeaders && len(sm.Headers) > 0 {
+				sm.RowCounter = 1
+				headerRow := make([]interface{}, len(sm.Headers))
+				for i, h := range sm.Headers {
+					headerRow[i] = excelize.Cell{
+						Value:   h,
+						StyleID: sm.HeaderStyles[i],
+					}
+				}
+
+				cell := fmt.Sprintf("A%d", sm.RowCounter)
+				if err := sm.StreamWriter.SetRow(cell, headerRow, excelize.RowOpts{Height: sm.HeightHeader}); err != nil {
+					return fmt.Errorf("ошибка записи заголовков: %v", err)
+				}
+				sm.RowCounter++
+			}
+		}
+
+		stringRow, err := rows.Columns()
+		if err != nil {
+			return fmt.Errorf("ошибка чтения строки: %v", err)
+		}
+
+		rowData := make([]interface{}, len(stringRow))
+		for i, cellVal := range stringRow {
+			styleID := 0
+			if i < len(sm.RowStyles) {
+				styleID = sm.RowStyles[i]
+			}
+
+			colName, _ := excelize.ColumnNumberToName(i + 1)
+			cellRef := fmt.Sprintf("%s%d", colName, rowInFile)
+
+			var valType excelize.CellType
+			if sm.UseTemplate && i < len(sm.ValueTypes) {
+				valType = sm.ValueTypes[i]
+			} else {
+				valType, _ = f.GetCellType(sheetSrc, cellRef)
+			}
+
+			var value interface{}
+			switch valType {
+			case excelize.CellTypeBool:
+				value = (cellVal == "1" || strings.ToLower(cellVal) == "true")
+			case excelize.CellTypeNumber:
+				if n, err := strconv.ParseFloat(cellVal, 64); err == nil {
+					value = n
+					if !sm.UseTemplate {
+						decimals := 0
+						if parts := strings.Split(cellVal, "."); len(parts) == 2 {
+							decimals = len(parts[1])
+						}
+						cacheKey := fmt.Sprintf("%d_%d", i, decimals)
+						if cachedStyle, ok := sm.StyleCache[cacheKey]; ok {
+							styleID = cachedStyle
+						} else {
+							sm.StyleCache[cacheKey] = styleID
+						}
+					}
+				} else {
+					value = cellVal
+				}
+			case excelize.CellTypeDate:
+				value = cellVal
+			default:
+				value = cellVal
+			}
+
+			rowData[i] = excelize.Cell{
+				Value:   value,
+				StyleID: styleID,
+			}
+		}
+
+		if sm.Cfg.AddSourceFile {
+			rowData = append(rowData, filepath.Base(path))
+		}
+
+		//height, _ := f.GetRowHeight(sheetSrc, rowInFile)
+		height := rows.GetRowOpts().Height
+		cell := fmt.Sprintf("A%d", sm.RowCounter)
+		if err := sm.StreamWriter.SetRow(cell, rowData, excelize.RowOpts{Height: height}); err != nil {
+			return fmt.Errorf("ошибка записи строки: %v", err)
+		}
+
+		sm.RowCounter++
+		rowInFile++
+	}
+
+	return nil
+}
+
+func (sm *StreamMerger) prepareTemplate() error {
+	fTemplate, err := excelize.OpenFile(sm.Cfg.TemplatePath)
+	if err != nil {
+		return fmt.Errorf("ошибка открытия шаблона: %v", err)
+	}
+	defer fTemplate.Close()
+
+	sheetList := fTemplate.GetSheetList()
+	if len(sheetList) == 0 {
+		return fmt.Errorf("шаблон пустой, нет листов")
+	}
+	sheet := sheetList[0]
+
+	rows, err := fTemplate.Rows(sheet)
+	if err != nil {
+		return err
+	}
+
+	// Получение заголовков
 	if len(sm.Headers) == 0 && rows.Next() {
 		headers, _ := rows.Columns()
-		if cfg.AddSourceFile {
-			if cfg.HasHeaders {
+		if sm.Cfg.AddSourceFile {
+			if sm.Cfg.HasHeaders {
 				sm.Headers = append(headers, "SourceFile")
 			} else {
 				sm.Headers = append(headers, "")
@@ -152,284 +236,134 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 		} else {
 			sm.Headers = headers
 		}
-		// Получение высоты для строки заголовка
-		heightHeader = rows.GetRowOpts().Height
+		sm.HeightHeader = rows.GetRowOpts().Height
 	}
 
-	// Получаем стили заголовков (первой строки) и первой строки данных (второй строки)
-	headerStyles := make([]int, len(sm.Headers))
-	rowStyles := make([]int, len(sm.Headers))
+	// Стили заголовков и первой строки данных
+	sm.HeaderStyles = make([]int, len(sm.Headers))
+	sm.RowStyles = make([]int, len(sm.Headers))
+	// Определение типов данных
+	sm.ValueTypes = make([]excelize.CellType, len(sm.Headers))
+
 	for col := 1; col <= len(sm.Headers); col++ {
 		cell1, _ := excelize.CoordinatesToCellName(col, 1)
-		styleID1, err := outFile.GetCellStyle(sheet, cell1)
-		if err != nil {
-			styleID1 = 0
-		}
-		headerStyles[col-1] = styleID1
+		styleID1, _ := fTemplate.GetCellStyle(sheet, cell1)
+		sm.HeaderStyles[col-1] = styleID1
 
 		cell2, _ := excelize.CoordinatesToCellName(col, 2)
-		styleID2, err := outFile.GetCellStyle(sheet, cell2)
-		if err != nil {
-			styleID2 = 0
-		}
-		rowStyles[col-1] = styleID2
-	}
+		styleID2, _ := fTemplate.GetCellStyle(sheet, cell2)
+		sm.RowStyles[col-1] = styleID2
 
-	// Подготовить карту типов значений из шаблона
-	valueTypes := make([]excelize.CellType, len(sm.Headers))
-	for col := 1; col <= len(sm.Headers); col++ {
-		cellRef, _ := excelize.CoordinatesToCellName(col, 2)
-		//cellVal, _ := outFile.GetCellValue(sheet, cellRef)
-		//log.Print(cellVal)
-
-		t, err := outFile.GetCellType(sheet, cellRef)
-
+		t, err := fTemplate.GetCellType(sheet, cell2)
 		if err != nil {
 			t = excelize.CellTypeInlineString
-		} else {
-			if t == excelize.CellTypeUnset {
-				styleID, _ := outFile.GetCellStyle(sheet, cellRef)
-				style, _ := outFile.GetStyle(styleID)
-
-				switch {
-				case isDateFormat(style.NumFmt):
-					t = excelize.CellTypeDate
-				case isNumericFormat(style.NumFmt):
-					t = excelize.CellTypeNumber
-				default:
-					t = excelize.CellTypeInlineString
-				}
+		} else if t == excelize.CellTypeUnset {
+			styleID, _ := fTemplate.GetCellStyle(sheet, cell2)
+			style, _ := fTemplate.GetStyle(styleID)
+			switch {
+			case isDateFormat(style.NumFmt):
+				t = excelize.CellTypeDate
+			case isNumericFormat(style.NumFmt):
+				t = excelize.CellTypeNumber
+			default:
+				t = excelize.CellTypeInlineString
 			}
 		}
-		valueTypes[col-1] = t
+		sm.ValueTypes[col-1] = t
 	}
 
-	// заполняем кеш стилей по файлу шаблону
-	var styleCache map[string]int // cacheKey = colIndex_decimals
-	if !useTemplate {
-
-		styleCache = make(map[string]int)
-		tmplRows, err := outFile.Rows(sheet)
+	// Кеш стилей, если не передан TemplatePath
+	if !sm.UseTemplate {
+		sm.StyleCache = make(map[string]int)
+		tmplRows, err := fTemplate.Rows(sheet)
 		if err != nil {
-			return nil, fmt.Errorf("ошибка чтения строк шаблона: %v", err)
+			return fmt.Errorf("ошибка чтения строк шаблона: %v", err)
 		}
-
 		rowIdx := 1
-		for tmplRows.Next() && rowIdx <= cfg.SampleRows {
+		for tmplRows.Next() && rowIdx <= sm.Cfg.SampleRows {
 			values, err := tmplRows.Columns()
 			if err != nil {
 				continue
 			}
-
 			for i := 0; i < len(values) && i < len(sm.Headers); i++ {
 				cellVal := values[i]
 				colName, _ := excelize.ColumnNumberToName(i + 1)
 				cellRef := fmt.Sprintf("%s%d", colName, rowIdx)
-
-				cellType, _ := outFile.GetCellType(sheet, cellRef)
+				cellType, _ := fTemplate.GetCellType(sheet, cellRef)
 				if cellType != excelize.CellTypeNumber {
 					continue
 				}
-
 				decimals := 0
 				if parts := strings.Split(cellVal, "."); len(parts) == 2 {
 					decimals = len(parts[1])
 				}
-
-				styleID, err := outFile.GetCellStyle(sheet, cellRef)
+				styleID, err := fTemplate.GetCellStyle(sheet, cellRef)
 				if err != nil {
 					continue
 				}
-
 				cacheKey := fmt.Sprintf("%d_%d", i, decimals)
-				if _, ok := styleCache[cacheKey]; !ok {
-					styleCache[cacheKey] = styleID
+				if _, ok := sm.StyleCache[cacheKey]; !ok {
+					sm.StyleCache[cacheKey] = styleID
 				}
-
 			}
 			rowIdx++
 		}
 	}
 
-	_ = outFile.Close()
-	outFile = nil
+	return nil
+}
 
-	if err := newOutput(); err != nil {
+func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
+
+	sm.Cfg = cfg
+	sm.PartCounter = 1
+
+	// Удаляем старые файлы перед началом
+	if err := removeExistingPartFiles(cfg); err != nil {
+		return nil, err
+	}
+
+	// получаем список входящих файлов и путь к файлу шаблона
+	inputFiles, templatePath, err := getInputFilesAndTemplatePath(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	sm.Cfg.TemplatePath = templatePath
+
+	sm.UseTemplate = cfg.TemplatePath != ""
+
+	// подготовки заголовков, стилей и типов данных из шаблона
+	if err := sm.prepareTemplate(); err != nil {
+		return nil, err
+	}
+
+	// инициализация StreamWriter
+	if err := sm.newOutput(); err != nil {
 		return nil, err
 	}
 
 	// Обход всех файлов
 	for _, path := range inputFiles {
-
-		f, err := excelize.OpenFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("ошибка открытия файла %s: %v", path, err)
+		if err := sm.processInputFile(path); err != nil {
+			return nil, err
 		}
-
-		sheetListSrc := f.GetSheetList()
-		if len(sheetListSrc) == 0 {
-			continue
-		}
-		sheetSrc := sheetListSrc[0]
-		rows, err := f.Rows(sheetSrc)
-		if err != nil {
-			return nil, fmt.Errorf("ошибка чтения строк из %s: %v", path, err)
-		}
-
-		/*
-			for colIdx := 1; colIdx <= len(sm.Headers); colIdx++ {
-				// Получаем имя колонки (например, "A", "B")
-				colName, _ := excelize.ColumnNumberToName(colIdx)
-
-				// Получаем ширину колонки из исходного листа
-				width, err := f.GetColWidth(sheetSrc, colName)
-				if err != nil {
-					continue // Пропускаем ошибки
-				}
-
-				widthCurrent, err := outFile.GetColWidth(sheet, colName)
-				if err != nil {
-					continue // Пропускаем ошибки
-				}
-
-				if width > widthCurrent {
-					// Устанавливаем такую же ширину в целевом листе
-					outFile.SetColWidth(sheet, colName, colName, width)
-				}
-			}
-		*/
-
-		rowInFile := 1
-
-		if cfg.HasHeaders {
-			rows.Next() // пропуск первой строки
-			rowInFile++
-		}
-
-		for rows.Next() {
-
-			if cfg.MaxRowPerFile > 0 && rowCounter >= cfg.MaxRowPerFile {
-				if err := newOutput(); err != nil {
-					return nil, err
-				}
-			}
-
-			if rowCounter == 0 {
-				// Пишем заголовки при каждом новом файле
-				// Записываем заголовки с применением стилей
-				if cfg.HasHeaders && len(sm.Headers) > 0 {
-					rowCounter = 1
-					headerRow := make([]interface{}, len(sm.Headers))
-					for i, h := range sm.Headers {
-						headerRow[i] = excelize.Cell{
-							Value:   h,
-							StyleID: headerStyles[i],
-						}
-					}
-
-					cell := fmt.Sprintf("A%d", rowCounter)
-					if err := streamWriter.SetRow(cell, headerRow, excelize.RowOpts{Height: heightHeader}); err != nil {
-						return nil, fmt.Errorf("ошибка записи заголовков: %v", err)
-					}
-					rowCounter++
-				}
-			}
-
-			stringRow, err := rows.Columns()
-			if err != nil {
-				return nil, fmt.Errorf("ошибка чтения строки: %v", err)
-			}
-
-			rowData := make([]interface{}, len(stringRow))
-
-			for i, cellVal := range stringRow {
-
-				styleID := 0
-				if i < len(rowStyles) {
-					styleID = rowStyles[i]
-				}
-				colName, _ := excelize.ColumnNumberToName(i + 1)
-				cellRef := fmt.Sprintf("%s%d", colName, rowInFile)
-
-				var valType excelize.CellType
-				if useTemplate && i < len(valueTypes) {
-					valType = valueTypes[i]
-				} else {
-					valType, _ = f.GetCellType(sheetSrc, cellRef)
-				}
-
-				var value interface{}
-				switch valType {
-				case excelize.CellTypeBool:
-					value = (cellVal == "1" || strings.ToLower(cellVal) == "true")
-				case excelize.CellTypeNumber:
-					if n, err := strconv.ParseFloat(cellVal, 64); err == nil {
-
-						value = n
-
-						// Определение количества знаков после запятой
-						decimals := 0
-						if parts := strings.Split(cellVal, "."); len(parts) == 2 {
-							decimals = len(parts[1])
-						}
-
-						if !useTemplate {
-							cacheKey := fmt.Sprintf("%d_%d", i, decimals)
-							if cachedStyle, ok := styleCache[cacheKey]; ok {
-								styleID = cachedStyle
-							} else {
-								styleCache[cacheKey] = styleID // сохранить базовый как fallback
-							}
-						}
-
-					} else {
-						value = cellVal
-					}
-				case excelize.CellTypeDate:
-					value = cellVal // Можно попробовать конвертировать, но Excel форматирует их как строки
-				default:
-					value = cellVal
-				}
-
-				rowData[i] = excelize.Cell{
-					Value:   value,
-					StyleID: styleID,
-				}
-			}
-
-			if cfg.AddSourceFile {
-				rowData = append(rowData, filepath.Base(path))
-			}
-
-			// Получение высоты для строки rowInFile
-			height, _ := f.GetRowHeight(sheetSrc, rowInFile)
-
-			cell := fmt.Sprintf("A%d", rowCounter)
-			if err := streamWriter.SetRow(cell, rowData, excelize.RowOpts{Height: height}); err != nil {
-				return nil, fmt.Errorf("ошибка записи строки: %v", err)
-			}
-
-			rowCounter++
-			rowInFile++
-		}
-
-		_ = f.Close()
-
 	}
 
 	// Заключительный flush
-	if err := streamWriter.Flush(); err != nil {
+	if err := sm.StreamWriter.Flush(); err != nil {
 		return nil, fmt.Errorf("ошибка финального flush: %v", err)
 	}
-	fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"), partCounter)
-	if err := outFile.SaveAs(fileName); err != nil {
+	fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"), sm.PartCounter)
+	if err := sm.OutFile.SaveAs(fileName); err != nil {
 		return nil, fmt.Errorf("ошибка сохранения файла: %v", err)
 	}
-	outputFiles = append(outputFiles, fileName)
 
-	_ = outFile.Close()
+	sm.OutputFiles = append(sm.OutputFiles, fileName)
 
-	return outputFiles, nil
+	_ = sm.OutFile.Close()
+
+	return sm.OutputFiles, nil
 
 }
 
@@ -462,4 +396,44 @@ func isNumericFormat(fmtID int) bool {
 		return true
 	}
 	return false
+}
+
+func getInputFilesAndTemplatePath(cfg *config.Config) ([]string, string, error) {
+	var (
+		templatePath string
+		maxFileSize  int64
+	)
+
+	inputFiles := []string{}
+
+	err := filepath.Walk(cfg.InputDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || filepath.Ext(path) != ".xlsx" {
+			return nil
+		}
+
+		inputFiles = append(inputFiles, path)
+
+		if cfg.TemplatePath == "" && info.Size() > maxFileSize {
+			maxFileSize = info.Size()
+			templatePath = path
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("ошибка при обходе папки: %w", err)
+	}
+
+	if cfg.TemplatePath != "" {
+		if _, err := os.Stat(cfg.TemplatePath); os.IsNotExist(err) {
+			return nil, "", fmt.Errorf("шаблонный файл не найден: %s", cfg.TemplatePath)
+		}
+		templatePath = cfg.TemplatePath
+	}
+
+	if templatePath == "" {
+		return nil, "", fmt.Errorf("не удалось определить шаблонный файл")
+	}
+
+	return inputFiles, templatePath, nil
 }

@@ -37,7 +37,9 @@ func ParseFlags() (*Config, error) {
 	// Нормализация путей
 	cfg.InputDir = filepath.Clean(cfg.InputDir)
 	cfg.OutputPath = filepath.Clean(cfg.OutputPath)
-	cfg.TemplatePath = filepath.Clean(cfg.TemplatePath)
+	if cfg.TemplatePath != "" {
+		cfg.TemplatePath = filepath.Clean(cfg.TemplatePath)
+	}
 
 	return cfg, nil
 }
