@@ -43,19 +43,28 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 			return nil
 		}
 
-		if info.Size() > maxFileSize {
+		inputFiles = append(inputFiles, path)
+
+		if cfg.TemplatePath == "" && info.Size() > maxFileSize {
 			maxFileSize = info.Size()
 			templatePath = path
 		}
 
-		inputFiles = append(inputFiles, path)
-
 		return nil
 	})
 
-	if templatePath == "" {
-		return nil, fmt.Errorf("нет файлов для объединения")
+	if cfg.TemplatePath != "" {
+		if _, err := os.Stat(cfg.TemplatePath); os.IsNotExist(err) {
+			return nil, fmt.Errorf("шаблонный файл не найден: %s", cfg.TemplatePath)
+		}
+		templatePath = cfg.TemplatePath
 	}
+
+	if templatePath == "" {
+		return nil, fmt.Errorf("не удалось определить шаблонный файл")
+	}
+
+	useTemplate := cfg.TemplatePath != ""
 
 	partCounter := 1
 	rowCounter := int64(0)
@@ -130,6 +139,7 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 		return nil, err
 	}
 
+	heightHeader := 0.0
 	// Получаем заголовки из первого файла
 	if len(sm.Headers) == 0 && rows.Next() {
 		headers, _ := rows.Columns()
@@ -142,10 +152,9 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 		} else {
 			sm.Headers = headers
 		}
+		// Получение высоты для строки заголовка
+		heightHeader = rows.GetRowOpts().Height
 	}
-
-	// Получение высоты для строки заголовка
-	heightHeader, _ := outFile.GetRowHeight(sheet, 1)
 
 	// Получаем стили заголовков (первой строки) и первой строки данных (второй строки)
 	headerStyles := make([]int, len(sm.Headers))
@@ -166,48 +175,80 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 		rowStyles[col-1] = styleID2
 	}
 
-	// заполняем кеш стилей
-	styleCache := make(map[string]int) // cacheKey = colIndex_decimals
+	// Подготовить карту типов значений из шаблона
+	valueTypes := make([]excelize.CellType, len(sm.Headers))
+	for col := 1; col <= len(sm.Headers); col++ {
+		cellRef, _ := excelize.CoordinatesToCellName(col, 2)
+		//cellVal, _ := outFile.GetCellValue(sheet, cellRef)
+		//log.Print(cellVal)
 
-	tmplRows, err := outFile.Rows(sheet)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка чтения строк шаблона: %v", err)
+		t, err := outFile.GetCellType(sheet, cellRef)
+
+		if err != nil {
+			t = excelize.CellTypeInlineString
+		} else {
+			if t == excelize.CellTypeUnset {
+				styleID, _ := outFile.GetCellStyle(sheet, cellRef)
+				style, _ := outFile.GetStyle(styleID)
+
+				switch {
+				case isDateFormat(style.NumFmt):
+					t = excelize.CellTypeDate
+				case isNumericFormat(style.NumFmt):
+					t = excelize.CellTypeNumber
+				default:
+					t = excelize.CellTypeInlineString
+				}
+			}
+		}
+		valueTypes[col-1] = t
 	}
 
-	rowIdx := 1
-	for tmplRows.Next() && rowIdx <= cfg.SampleRows {
-		values, err := tmplRows.Columns()
+	// заполняем кеш стилей по файлу шаблону
+	var styleCache map[string]int // cacheKey = colIndex_decimals
+	if !useTemplate {
+
+		styleCache = make(map[string]int)
+		tmplRows, err := outFile.Rows(sheet)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("ошибка чтения строк шаблона: %v", err)
 		}
 
-		for i := 0; i < len(values) && i < len(sm.Headers); i++ {
-			cellVal := values[i]
-			colName, _ := excelize.ColumnNumberToName(i + 1)
-			cellRef := fmt.Sprintf("%s%d", colName, rowIdx)
-
-			cellType, _ := outFile.GetCellType(sheet, cellRef)
-			if cellType != excelize.CellTypeNumber {
-				continue
-			}
-
-			decimals := 0
-			if parts := strings.Split(cellVal, "."); len(parts) == 2 {
-				decimals = len(parts[1])
-			}
-
-			styleID, err := outFile.GetCellStyle(sheet, cellRef)
+		rowIdx := 1
+		for tmplRows.Next() && rowIdx <= cfg.SampleRows {
+			values, err := tmplRows.Columns()
 			if err != nil {
 				continue
 			}
 
-			cacheKey := fmt.Sprintf("%d_%d", i, decimals)
-			if _, ok := styleCache[cacheKey]; !ok {
-				styleCache[cacheKey] = styleID
-			}
+			for i := 0; i < len(values) && i < len(sm.Headers); i++ {
+				cellVal := values[i]
+				colName, _ := excelize.ColumnNumberToName(i + 1)
+				cellRef := fmt.Sprintf("%s%d", colName, rowIdx)
 
+				cellType, _ := outFile.GetCellType(sheet, cellRef)
+				if cellType != excelize.CellTypeNumber {
+					continue
+				}
+
+				decimals := 0
+				if parts := strings.Split(cellVal, "."); len(parts) == 2 {
+					decimals = len(parts[1])
+				}
+
+				styleID, err := outFile.GetCellStyle(sheet, cellRef)
+				if err != nil {
+					continue
+				}
+
+				cacheKey := fmt.Sprintf("%d_%d", i, decimals)
+				if _, ok := styleCache[cacheKey]; !ok {
+					styleCache[cacheKey] = styleID
+				}
+
+			}
+			rowIdx++
 		}
-		rowIdx++
 	}
 
 	_ = outFile.Close()
@@ -235,26 +276,28 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 			return nil, fmt.Errorf("ошибка чтения строк из %s: %v", path, err)
 		}
 
-		for colIdx := 1; colIdx <= len(sm.Headers); colIdx++ {
-			// Получаем имя колонки (например, "A", "B")
-			colName, _ := excelize.ColumnNumberToName(colIdx)
+		/*
+			for colIdx := 1; colIdx <= len(sm.Headers); colIdx++ {
+				// Получаем имя колонки (например, "A", "B")
+				colName, _ := excelize.ColumnNumberToName(colIdx)
 
-			// Получаем ширину колонки из исходного листа
-			width, err := f.GetColWidth(sheetSrc, colName)
-			if err != nil {
-				continue // Пропускаем ошибки
-			}
+				// Получаем ширину колонки из исходного листа
+				width, err := f.GetColWidth(sheetSrc, colName)
+				if err != nil {
+					continue // Пропускаем ошибки
+				}
 
-			widthCurrent, err := outFile.GetColWidth(sheet, colName)
-			if err != nil {
-				continue // Пропускаем ошибки
-			}
+				widthCurrent, err := outFile.GetColWidth(sheet, colName)
+				if err != nil {
+					continue // Пропускаем ошибки
+				}
 
-			if width > widthCurrent {
-				// Устанавливаем такую же ширину в целевом листе
-				outFile.SetColWidth(sheet, colName, colName, width)
+				if width > widthCurrent {
+					// Устанавливаем такую же ширину в целевом листе
+					outFile.SetColWidth(sheet, colName, colName, width)
+				}
 			}
-		}
+		*/
 
 		rowInFile := 1
 
@@ -305,14 +348,15 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 				if i < len(rowStyles) {
 					styleID = rowStyles[i]
 				}
-				rowData[i] = excelize.Cell{
-					Value:   cellVal,
-					StyleID: styleID,
-				}
 				colName, _ := excelize.ColumnNumberToName(i + 1)
 				cellRef := fmt.Sprintf("%s%d", colName, rowInFile)
 
-				valType, _ := f.GetCellType(sheetSrc, cellRef)
+				var valType excelize.CellType
+				if useTemplate && i < len(valueTypes) {
+					valType = valueTypes[i]
+				} else {
+					valType, _ = f.GetCellType(sheetSrc, cellRef)
+				}
 
 				var value interface{}
 				switch valType {
@@ -329,12 +373,15 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 							decimals = len(parts[1])
 						}
 
-						cacheKey := fmt.Sprintf("%d_%d", i, decimals)
-						if cachedStyle, ok := styleCache[cacheKey]; ok {
-							styleID = cachedStyle
-						} else {
-							styleCache[cacheKey] = styleID // сохранить базовый как fallback
+						if !useTemplate {
+							cacheKey := fmt.Sprintf("%d_%d", i, decimals)
+							if cachedStyle, ok := styleCache[cacheKey]; ok {
+								styleID = cachedStyle
+							} else {
+								styleCache[cacheKey] = styleID // сохранить базовый как fallback
+							}
 						}
+
 					} else {
 						value = cellVal
 					}
@@ -399,4 +446,20 @@ func removeExistingPartFiles(cfg *config.Config) error {
 		}
 	}
 	return nil
+}
+
+func isDateFormat(fmtID int) bool {
+	switch fmtID {
+	case 14, 15, 16, 17, 22, 27, 30, 36, 45, 46, 47:
+		return true
+	}
+	return false
+}
+
+func isNumericFormat(fmtID int) bool {
+	switch fmtID {
+	case 1, 2, 3, 4, 10, 37, 38, 39, 40:
+		return true
+	}
+	return false
 }

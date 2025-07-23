@@ -11,8 +11,9 @@ type Config struct {
 	OutputPath    string
 	SampleRows    int
 	AddSourceFile bool
-	HasHeaders    bool  // Флаг наличия заголовков в исходных файлах
-	MaxRowPerFile int64 // максимальное количество строк в объединенном файле
+	HasHeaders    bool   // Флаг наличия заголовков в исходных файлах
+	MaxRowPerFile int64  // максимальное количество строк в объединенном файле
+	TemplatePath  string // путь к файлу шаблону
 }
 
 func ParseFlags() (*Config, error) {
@@ -25,6 +26,7 @@ func ParseFlags() (*Config, error) {
 	flag.BoolVar(&cfg.AddSourceFile, "add-source", false, "добавлять колонку с именем файла")
 	flag.BoolVar(&cfg.HasHeaders, "has-headers", false, "исходные файлы содержат заголовки")
 	flag.Int64Var(&cfg.MaxRowPerFile, "max-row", 600000, "максимальное количество строк в объединенном файле")
+	flag.StringVar(&cfg.TemplatePath, "template", "", "путь к файлу шаблону")
 
 	flag.Parse()
 
@@ -35,6 +37,7 @@ func ParseFlags() (*Config, error) {
 	// Нормализация путей
 	cfg.InputDir = filepath.Clean(cfg.InputDir)
 	cfg.OutputPath = filepath.Clean(cfg.OutputPath)
+	cfg.TemplatePath = filepath.Clean(cfg.TemplatePath)
 
 	return cfg, nil
 }
