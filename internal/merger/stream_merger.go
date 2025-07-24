@@ -1,15 +1,29 @@
 package merger
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/ryabkov82/xlsx-merger/internal/config"
 	"github.com/xuri/excelize/v2"
 )
+
+type RowPayload struct {
+	FileIndex int
+	Cells     []interface{}
+	Height    float64
+	//Done      bool
+}
+
+type FileJob struct {
+	Index int
+	Path  string
+}
 
 type StreamMerger struct {
 	BaseMerger
@@ -27,6 +41,7 @@ type StreamMerger struct {
 	OutFile      *excelize.File
 	PartCounter  int
 	OutputFiles  []string
+	RowCount     int64
 }
 
 func NewStreamMerger() FileMerger {
@@ -45,7 +60,7 @@ func (sm *StreamMerger) newOutput() error {
 		if err := sm.OutFile.SaveAs(fileName); err != nil {
 			return fmt.Errorf("ошибка сохранения файла: %v", err)
 		}
-		_ = sm.OutFile.Close()
+		//_ = sm.OutFile.Close()
 		sm.OutputFiles = append(sm.OutputFiles, fileName)
 		sm.PartCounter++
 	}
@@ -79,10 +94,31 @@ func (sm *StreamMerger) newOutput() error {
 	sm.OutFile.DeleteSheet(sheetList[0])
 	sm.RowCounter = 0
 
+	if sm.Cfg.HasHeaders && len(sm.Headers) > 0 {
+		headerRow := make([]interface{}, len(sm.Headers))
+		for i, h := range sm.Headers {
+			headerRow[i] = excelize.Cell{
+				Value:   h,
+				StyleID: sm.HeaderStyles[i],
+			}
+		}
+
+		cell := fmt.Sprintf("A%d", sm.RowCounter+1)
+		if err := sm.StreamWriter.SetRow(cell, headerRow, excelize.RowOpts{Height: sm.HeightHeader}); err != nil {
+			return fmt.Errorf("ошибка записи заголовка: %v", err)
+		}
+		sm.RowCounter++
+
+	}
+
 	return nil
 }
 
-func (sm *StreamMerger) processInputFile(path string) error {
+// processInputFile читает файл, готовит rowData и отправляет в канал
+func (sm *StreamMerger) processInputFile(ctx context.Context, fileIndex int, path string, rowChan chan<- RowPayload) error {
+
+	defer close(rowChan)
+
 	f, err := excelize.OpenFile(path)
 	if err != nil {
 		return fmt.Errorf("ошибка открытия файла %s: %v", path, err)
@@ -107,30 +143,6 @@ func (sm *StreamMerger) processInputFile(path string) error {
 	}
 
 	for rows.Next() {
-		if sm.Cfg.MaxRowPerFile > 0 && sm.RowCounter >= sm.Cfg.MaxRowPerFile {
-			if err := sm.newOutput(); err != nil {
-				return err
-			}
-		}
-
-		if sm.RowCounter == 0 {
-			if sm.Cfg.HasHeaders && len(sm.Headers) > 0 {
-				sm.RowCounter = 1
-				headerRow := make([]interface{}, len(sm.Headers))
-				for i, h := range sm.Headers {
-					headerRow[i] = excelize.Cell{
-						Value:   h,
-						StyleID: sm.HeaderStyles[i],
-					}
-				}
-
-				cell := fmt.Sprintf("A%d", sm.RowCounter)
-				if err := sm.StreamWriter.SetRow(cell, headerRow, excelize.RowOpts{Height: sm.HeightHeader}); err != nil {
-					return fmt.Errorf("ошибка записи заголовков: %v", err)
-				}
-				sm.RowCounter++
-			}
-		}
 
 		stringRow, err := rows.Columns()
 		if err != nil {
@@ -194,12 +206,16 @@ func (sm *StreamMerger) processInputFile(path string) error {
 
 		//height, _ := f.GetRowHeight(sheetSrc, rowInFile)
 		height := rows.GetRowOpts().Height
-		cell := fmt.Sprintf("A%d", sm.RowCounter)
-		if err := sm.StreamWriter.SetRow(cell, rowData, excelize.RowOpts{Height: height}); err != nil {
-			return fmt.Errorf("ошибка записи строки: %v", err)
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		rowChan <- RowPayload{
+			FileIndex: fileIndex,
+			Cells:     rowData,
+			Height:    height,
 		}
 
-		sm.RowCounter++
 		rowInFile++
 	}
 
@@ -313,20 +329,73 @@ func (sm *StreamMerger) prepareTemplate() error {
 	return nil
 }
 
-func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
+// writerLoop читает из канала и пишет данные в streamWriter, переключая файлы по maxRow
+func (sm *StreamMerger) writerLoop(ctx context.Context, cancel context.CancelFunc, rowChans []<-chan RowPayload, doneChan chan<- error) {
+
+	for expected := 0; expected < len(rowChans); expected++ {
+		ch := rowChans[expected]
+		for {
+			select {
+			case <-ctx.Done():
+				doneChan <- ctx.Err()
+				return
+			case payload, ok := <-ch:
+				if !ok {
+					// канал закрыт, переходим к следующему
+					ch = nil
+				}
+
+				if sm.Cfg.MaxRowPerFile > 0 && sm.RowCounter >= sm.Cfg.MaxRowPerFile {
+					if err := sm.newOutput(); err != nil {
+						cancel() // посылаем сигнал записывающим горутинам
+						doneChan <- fmt.Errorf("ошибка создания нового файла: %w", err)
+						return
+					}
+				}
+				cell := fmt.Sprintf("A%d", sm.RowCounter+1)
+				if err := sm.StreamWriter.SetRow(cell, payload.Cells, excelize.RowOpts{Height: payload.Height}); err != nil {
+					cancel()
+					doneChan <- fmt.Errorf("ошибка записи строки: %w", err)
+					return
+				}
+				sm.RowCounter++
+				sm.RowCount++
+			}
+			if ch == nil {
+				break
+			}
+		}
+	}
+
+	if err := sm.StreamWriter.Flush(); err != nil {
+		cancel()
+		doneChan <- fmt.Errorf("ошибка финального flush: %w", err)
+		return
+	}
+	fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(sm.Cfg.OutputPath, ".xlsx"), sm.PartCounter)
+	if err := sm.OutFile.SaveAs(fileName); err != nil {
+		cancel()
+		doneChan <- fmt.Errorf("ошибка сохранения файла: %w", err)
+		return
+	}
+	sm.OutputFiles = append(sm.OutputFiles, fileName)
+	doneChan <- nil
+}
+
+func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, int64, error) {
 
 	sm.Cfg = cfg
 	sm.PartCounter = 1
 
 	// Удаляем старые файлы перед началом
 	if err := removeExistingPartFiles(cfg); err != nil {
-		return nil, err
+		return nil, sm.RowCount, err
 	}
 
 	// получаем список входящих файлов и путь к файлу шаблона
 	inputFiles, templatePath, err := getInputFilesAndTemplatePath(cfg)
 	if err != nil {
-		return nil, err
+		return nil, sm.RowCount, err
 	}
 
 	sm.Cfg.TemplatePath = templatePath
@@ -335,36 +404,81 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, error) {
 
 	// подготовки заголовков, стилей и типов данных из шаблона
 	if err := sm.prepareTemplate(); err != nil {
-		return nil, err
+		return nil, sm.RowCount, err
 	}
 
 	// инициализация StreamWriter
 	if err := sm.newOutput(); err != nil {
-		return nil, err
+		return nil, sm.RowCount, err
 	}
 
-	// Обход всех файлов
-	for _, path := range inputFiles {
-		if err := sm.processInputFile(path); err != nil {
-			return nil, err
+	workerCount := 4
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // гарантирует освобождение ресурсов
+
+	// Создаем отдельный канал для каждого файла
+	rowChans := make([]chan RowPayload, len(inputFiles))
+	for i := range rowChans {
+		rowChans[i] = make(chan RowPayload, 5000) // буфер на файл, можно менять
+	}
+
+	done := make(chan error)
+
+	go sm.writerLoop(ctx, cancel, toReadOnlyChans(rowChans), done)
+
+	// воркеры чтения
+	var wg sync.WaitGroup
+	fileCh := make(chan FileJob, workerCount)
+
+	wg.Add(workerCount)
+
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer wg.Done()
+			for job := range fileCh {
+				// Прекращаем работу, если контекст отменён
+				if ctx.Err() != nil {
+					return
+				}
+
+				if err := sm.processInputFile(ctx, job.Index, job.Path, rowChans[job.Index]); err != nil {
+					// Отменяем контекст, чтобы остальные остановились
+					cancel()
+					// Ошибка может быть записана только один раз в канал done:
+					select {
+					case done <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	// Отправка путей
+	go func() {
+		for i, path := range inputFiles {
+			fileCh <- FileJob{Index: i, Path: path}
 		}
+		close(fileCh)
+	}()
+
+	wg.Wait()
+
+	err = <-done
+	close(done)
+
+	return sm.OutputFiles, sm.RowCount, err
+}
+
+// Вспомогательная функция для преобразования []chan T в []<-chan T
+func toReadOnlyChans(chans []chan RowPayload) []<-chan RowPayload {
+	ro := make([]<-chan RowPayload, len(chans))
+	for i, ch := range chans {
+		ro[i] = ch
 	}
-
-	// Заключительный flush
-	if err := sm.StreamWriter.Flush(); err != nil {
-		return nil, fmt.Errorf("ошибка финального flush: %v", err)
-	}
-	fileName := fmt.Sprintf("%s_part%d.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"), sm.PartCounter)
-	if err := sm.OutFile.SaveAs(fileName); err != nil {
-		return nil, fmt.Errorf("ошибка сохранения файла: %v", err)
-	}
-
-	sm.OutputFiles = append(sm.OutputFiles, fileName)
-
-	_ = sm.OutFile.Close()
-
-	return sm.OutputFiles, nil
-
+	return ro
 }
 
 func removeExistingPartFiles(cfg *config.Config) error {
@@ -404,24 +518,35 @@ func getInputFilesAndTemplatePath(cfg *config.Config) ([]string, string, error) 
 		maxFileSize  int64
 	)
 
+	entries, err := os.ReadDir(cfg.InputDir)
+	if err != nil {
+		return nil, "", fmt.Errorf("ошибка при чтении директории: %w", err)
+	}
+
 	inputFiles := []string{}
 
-	err := filepath.Walk(cfg.InputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || filepath.Ext(path) != ".xlsx" {
-			return nil
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
 		}
 
-		inputFiles = append(inputFiles, path)
-
-		if cfg.TemplatePath == "" && info.Size() > maxFileSize {
-			maxFileSize = info.Size()
-			templatePath = path
+		if filepath.Ext(entry.Name()) != ".xlsx" {
+			continue
 		}
 
-		return nil
-	})
-	if err != nil {
-		return nil, "", fmt.Errorf("ошибка при обходе папки: %w", err)
+		fullPath := filepath.Join(cfg.InputDir, entry.Name())
+		inputFiles = append(inputFiles, fullPath)
+
+		if cfg.TemplatePath == "" {
+			info, err := entry.Info()
+			if err != nil {
+				continue // игнорируем ошибку чтения информации
+			}
+			if info.Size() > maxFileSize {
+				maxFileSize = info.Size()
+				templatePath = fullPath
+			}
+		}
 	}
 
 	if cfg.TemplatePath != "" {

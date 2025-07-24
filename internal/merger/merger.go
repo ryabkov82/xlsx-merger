@@ -5,7 +5,7 @@ import (
 )
 
 type FileMerger interface {
-	MergeFiles(cfg *config.Config) ([]string, error)
+	MergeFiles(cfg *config.Config) ([]string, int64, error)
 }
 
 type BaseMerger struct {
