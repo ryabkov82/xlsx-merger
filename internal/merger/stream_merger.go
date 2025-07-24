@@ -1,3 +1,5 @@
+// Package merger предоставляет функционал для слияния XLSX файлов
+// с поддержкой потоковой обработки и шаблонов.
 package merger
 
 import (
@@ -13,6 +15,10 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
+// RowPayload содержит данные строки для обработки
+// FileIndex - индекс исходного файла
+// Cells - значения ячеек строки
+// Height - высота строки
 type RowPayload struct {
 	FileIndex int
 	Cells     []interface{}
@@ -20,36 +26,55 @@ type RowPayload struct {
 	//Done      bool
 }
 
+// FileJob описывает задачу обработки файла
+// Index - порядковый индекс файла
+// Path - путь к файлу
 type FileJob struct {
 	Index int
 	Path  string
 }
 
+// StreamMerger реализует потоковое слияние XLSX файлов
+// Поддерживает:
+// - обработку больших файлов с ограничением памяти
+// - использование шаблонов для форматирования
+// - разделение результата на части
 type StreamMerger struct {
-	BaseMerger
-	// Специфичные для потоковой обработки поля
-	RowStyles    []int
-	HeaderStyles []int
-	ValueTypes   []excelize.CellType
-	StyleCache   map[string]int
-	UseTemplate  bool
-	Cfg          *config.Config
-	StreamWriter *excelize.StreamWriter
-	RowCounter   int64
-	HeightHeader float64
-	Sheet        string
-	OutFile      *excelize.File
-	PartCounter  int
-	OutputFiles  []string
-	RowCount     int64
+	BaseMerger // Встраиваем базовый функционал
+
+	// Стили и форматирование
+	RowStyles    []int               // Стили для строк данных
+	HeaderStyles []int               // Стили для заголовков
+	ValueTypes   []excelize.CellType // Типы данных для каждой колонки
+	StyleCache   map[string]int      // Кеш стилей для числовых форматов
+
+	// Конфигурация и состояние
+	UseTemplate  bool                   // Флаг использования шаблона
+	Cfg          *config.Config         // Конфигурация слияния
+	StreamWriter *excelize.StreamWriter // Потоковый писатель Excel
+	RowCounter   int64                  // Счетчик строк в текущем файле
+	HeightHeader float64                // Высота строки заголовка
+	Sheet        string                 // Имя листа для результатов
+	OutFile      *excelize.File         // Текущий выходной файл
+	PartCounter  int                    // Счетчик частей результата
+	OutputFiles  []string               // Пути к созданным файлам
+	RowCount     int64                  // Общее количество обработанных строк
 }
 
+// NewStreamMerger создает новый экземпляр StreamMerger
+// Возвращает интерфейс FileMerger
 func NewStreamMerger() FileMerger {
 	sm := &StreamMerger{}
 	sm.BaseMerger.Init() // Инициализация базовой части
 	return sm
 }
 
+// newOutput создает новый выходной файл на основе шаблона
+// Закрывает предыдущий файл если он был открыт
+// Возвращает ошибку если:
+// - не удалось создать файл
+// - шаблон не содержит листов
+// - не удалось создать StreamWriter
 func (sm *StreamMerger) newOutput() error {
 	// Завершение текущего файла
 	if sm.OutFile != nil {
@@ -60,20 +85,23 @@ func (sm *StreamMerger) newOutput() error {
 		if err := sm.OutFile.SaveAs(fileName); err != nil {
 			return fmt.Errorf("ошибка сохранения файла: %v", err)
 		}
-		//_ = sm.OutFile.Close()
+		_ = sm.OutFile.Close()
 		sm.OutputFiles = append(sm.OutputFiles, fileName)
 		sm.PartCounter++
 	}
 
+	// Создание нового файла на основе шаблона
 	var err error
 	sm.OutFile, err = excelize.OpenFile(sm.Cfg.TemplatePath)
 	if err != nil {
 		return fmt.Errorf("ошибка открытия шаблона: %v", err)
 	}
+	// Проверка наличия листов в шаблоне
 	sheetList := sm.OutFile.GetSheetList()
 	if len(sheetList) == 0 {
 		return fmt.Errorf("шаблон пустой, нет листов")
 	}
+	// Настройка нового листа для результатов
 	sm.Sheet = "merged"
 	sm.OutFile.NewSheet(sm.Sheet)
 
@@ -86,6 +114,7 @@ func (sm *StreamMerger) newOutput() error {
 		}
 	}
 
+	// Инициализация потокового писателя
 	sm.StreamWriter, err = sm.OutFile.NewStreamWriter(sm.Sheet)
 	if err != nil {
 		return fmt.Errorf("ошибка создания StreamWriter: %v", err)
@@ -94,6 +123,7 @@ func (sm *StreamMerger) newOutput() error {
 	sm.OutFile.DeleteSheet(sheetList[0])
 	sm.RowCounter = 0
 
+	// Запись заголовков если требуется
 	if sm.Cfg.HasHeaders && len(sm.Headers) > 0 {
 		headerRow := make([]interface{}, len(sm.Headers))
 		for i, h := range sm.Headers {
@@ -222,6 +252,14 @@ func (sm *StreamMerger) processInputFile(ctx context.Context, fileIndex int, pat
 	return nil
 }
 
+// prepareTemplate загружает и анализирует шаблон для:
+// - определения структуры заголовков
+// - извлечения стилей форматирования
+// - определения типов данных
+// Возвращает ошибку если:
+// - шаблон не может быть открыт
+// - шаблон не содержит данных
+// - не удалось прочитать строки шаблона
 func (sm *StreamMerger) prepareTemplate() error {
 	fTemplate, err := excelize.OpenFile(sm.Cfg.TemplatePath)
 	if err != nil {
@@ -343,23 +381,23 @@ func (sm *StreamMerger) writerLoop(ctx context.Context, cancel context.CancelFun
 				if !ok {
 					// канал закрыт, переходим к следующему
 					ch = nil
-				}
-
-				if sm.Cfg.MaxRowPerFile > 0 && sm.RowCounter >= sm.Cfg.MaxRowPerFile {
-					if err := sm.newOutput(); err != nil {
-						cancel() // посылаем сигнал записывающим горутинам
-						doneChan <- fmt.Errorf("ошибка создания нового файла: %w", err)
+				} else {
+					if sm.Cfg.MaxRowPerFile > 0 && sm.RowCounter >= sm.Cfg.MaxRowPerFile {
+						if err := sm.newOutput(); err != nil {
+							cancel() // посылаем сигнал записывающим горутинам
+							doneChan <- fmt.Errorf("ошибка создания нового файла: %w", err)
+							return
+						}
+					}
+					cell := fmt.Sprintf("A%d", sm.RowCounter+1)
+					if err := sm.StreamWriter.SetRow(cell, payload.Cells, excelize.RowOpts{Height: payload.Height}); err != nil {
+						cancel()
+						doneChan <- fmt.Errorf("ошибка записи строки: %w", err)
 						return
 					}
+					sm.RowCounter++
+					sm.RowCount++
 				}
-				cell := fmt.Sprintf("A%d", sm.RowCounter+1)
-				if err := sm.StreamWriter.SetRow(cell, payload.Cells, excelize.RowOpts{Height: payload.Height}); err != nil {
-					cancel()
-					doneChan <- fmt.Errorf("ошибка записи строки: %w", err)
-					return
-				}
-				sm.RowCounter++
-				sm.RowCount++
 			}
 			if ch == nil {
 				break
@@ -378,10 +416,18 @@ func (sm *StreamMerger) writerLoop(ctx context.Context, cancel context.CancelFun
 		doneChan <- fmt.Errorf("ошибка сохранения файла: %w", err)
 		return
 	}
+	_ = sm.OutFile.Close()
 	sm.OutputFiles = append(sm.OutputFiles, fileName)
 	doneChan <- nil
 }
 
+// MergeFiles выполняет слияние файлов согласно конфигурации
+// Потоково обрабатывает входные файлы с использованием worker-горутин
+// Разделяет результат на части при превышении MaxRowPerFile
+// Возвращает:
+// - список созданных файлов
+// - общее количество обработанных строк
+// - ошибку если таковая возникла
 func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, int64, error) {
 
 	sm.Cfg = cfg
@@ -481,6 +527,8 @@ func toReadOnlyChans(chans []chan RowPayload) []<-chan RowPayload {
 	return ro
 }
 
+// removeExistingPartFiles удаляет существующие частичные файлы результата
+// Используется для очистки перед новым слиянием
 func removeExistingPartFiles(cfg *config.Config) error {
 	pattern := fmt.Sprintf("%s_part*.xlsx", strings.TrimSuffix(cfg.OutputPath, ".xlsx"))
 	files, err := filepath.Glob(pattern)
@@ -512,6 +560,11 @@ func isNumericFormat(fmtID int) bool {
 	return false
 }
 
+// getInputFilesAndTemplatePath собирает входные файлы и определяет шаблон
+// Возвращает:
+// - список XLSX файлов в директории
+// - путь к шаблону (наибольший файл или из конфига)
+// - ошибку если файлы не найдены или шаблон недоступен
 func getInputFilesAndTemplatePath(cfg *config.Config) ([]string, string, error) {
 	var (
 		templatePath string
