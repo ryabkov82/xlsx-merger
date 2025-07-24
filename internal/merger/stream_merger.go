@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -466,7 +467,7 @@ func (sm *StreamMerger) MergeFiles(cfg *config.Config) ([]string, int64, error) 
 	// Создаем отдельный канал для каждого файла
 	rowChans := make([]chan RowPayload, len(inputFiles))
 	for i := range rowChans {
-		rowChans[i] = make(chan RowPayload, 5000) // буфер на файл, можно менять
+		rowChans[i] = make(chan RowPayload, 20000) // буфер на файл, можно менять
 	}
 
 	done := make(chan error)
@@ -566,51 +567,59 @@ func isNumericFormat(fmtID int) bool {
 // - путь к шаблону (наибольший файл или из конфига)
 // - ошибку если файлы не найдены или шаблон недоступен
 func getInputFilesAndTemplatePath(cfg *config.Config) ([]string, string, error) {
-	var (
-		templatePath string
-		maxFileSize  int64
-	)
+	type fileWithSize struct {
+		Path string
+		Size int64
+	}
+
+	var templatePath string
 
 	entries, err := os.ReadDir(cfg.InputDir)
 	if err != nil {
 		return nil, "", fmt.Errorf("ошибка при чтении директории: %w", err)
 	}
 
-	inputFiles := []string{}
+	var files []fileWithSize
 
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		if filepath.Ext(entry.Name()) != ".xlsx" {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".xlsx" {
 			continue
 		}
 
 		fullPath := filepath.Join(cfg.InputDir, entry.Name())
-		inputFiles = append(inputFiles, fullPath)
-
-		if cfg.TemplatePath == "" {
-			info, err := entry.Info()
-			if err != nil {
-				continue // игнорируем ошибку чтения информации
-			}
-			if info.Size() > maxFileSize {
-				maxFileSize = info.Size()
-				templatePath = fullPath
-			}
+		info, err := entry.Info()
+		if err != nil {
+			continue
 		}
+
+		files = append(files, fileWithSize{
+			Path: fullPath,
+			Size: info.Size(),
+		})
 	}
 
+	if len(files) == 0 {
+		return nil, "", fmt.Errorf("не найдено .xlsx файлов в директории")
+	}
+
+	// Сортировка по размеру по возрастанию
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Size < files[j].Size
+	})
+
+	inputFiles := make([]string, len(files))
+	for i, f := range files {
+		inputFiles[i] = f.Path
+	}
+
+	// Определение шаблона
 	if cfg.TemplatePath != "" {
 		if _, err := os.Stat(cfg.TemplatePath); os.IsNotExist(err) {
 			return nil, "", fmt.Errorf("шаблонный файл не найден: %s", cfg.TemplatePath)
 		}
 		templatePath = cfg.TemplatePath
-	}
-
-	if templatePath == "" {
-		return nil, "", fmt.Errorf("не удалось определить шаблонный файл")
+	} else {
+		templatePath = inputFiles[len(inputFiles)-1] // самый большой файл
 	}
 
 	return inputFiles, templatePath, nil
